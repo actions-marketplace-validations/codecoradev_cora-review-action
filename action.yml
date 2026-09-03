@@ -16,7 +16,7 @@ inputs:
     required: false
     default: 'major'
   cora-version:
-    description: 'cora-cli version tag (default: latest release)'
+    description: 'cora-code version tag (default: latest release)'
     required: false
     default: 'latest'
   upload-sarif:
@@ -39,7 +39,7 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Resolve cora-cli version
+    - name: Resolve cora-code version
       id: resolve
       shell: bash
       env:
@@ -47,9 +47,10 @@ runs:
       run: |
         if [ "$INPUT_VERSION" = "latest" ]; then
           for i in 1 2 3; do
+            # pipefail-safe: prevent set -e from aborting on curl/python3 pipeline failure
             VERSION=$(curl -sfL --connect-timeout 10 \
-              https://api.github.com/repos/codecoradev/cora-cli/releases/latest \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name', ''))" 2>/dev/null)
+              https://api.github.com/repos/codecoradev/cora-code/releases/latest \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tag_name', ''))" 2>/dev/null || true)
             if [ -n "$VERSION" ]; then
               break
             fi
@@ -57,16 +58,16 @@ runs:
             sleep 5
           done
           if [ -z "$VERSION" ]; then
-            echo "::warning::Failed to resolve latest cora-cli version from GitHub API, using fallback"
+            echo "::warning::Failed to resolve latest cora-code version from GitHub API, using fallback"
             VERSION="v0.3.0"
           fi
         else
           VERSION="$INPUT_VERSION"
         fi
         echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-        echo "Resolved cora-cli version: $VERSION"
+        echo "Resolved cora-code version: $VERSION"
 
-    - name: Install cora-cli
+    - name: Install cora-code
       shell: bash
       env:
         CORA_VERSION: ${{ steps.resolve.outputs.VERSION }}
@@ -81,8 +82,8 @@ runs:
           exit 1
         fi
 
-        DOWNLOAD_URL="https://github.com/codecoradev/cora-cli/releases/download/${CORA_VERSION}/${ASSET}-${CORA_VERSION}.tar.gz"
-        CHECKSUM_URL="https://github.com/codecoradev/cora-cli/releases/download/${CORA_VERSION}/checksums-sha256.txt"
+        DOWNLOAD_URL="https://github.com/codecoradev/cora-code/releases/download/${CORA_VERSION}/${ASSET}-${CORA_VERSION}.tar.gz"
+        CHECKSUM_URL="https://github.com/codecoradev/cora-code/releases/download/${CORA_VERSION}/checksums-sha256.txt"
 
         # Download tarball with retry + exponential backoff
         # Handles: CDN propagation delay on fresh releases, transient network errors, rate limits
@@ -186,8 +187,53 @@ runs:
 
           echo "Attempt $ATTEMPT: exit=$EXIT_CODE, sarif_bytes=$SARIF_BYTES"
 
-          # Success: cora exited 0 or produced valid SARIF output
-          if [ "$EXIT_CODE" -eq 0 ] || [ "$SARIF_BYTES" -gt 10 ]; then
+          # Detect cora's internal fallback SARIF (exit=0 but LLM call failed).
+          # cora catches LLM errors in SARIF mode and produces a small fallback SARIF
+          # with a single warning result containing "could not complete".
+          # IMPORTANT: A legitimate empty review (no issues found) also has 0 rules
+          # and 0 results. The ONLY reliable signal is the message text "could not complete"
+          # in results[0]. We must NOT treat empty results as fallback.
+          IS_FALLBACK=0
+          if [ "$EXIT_CODE" -eq 0 ] && [ "$SARIF_BYTES" -gt 10 ]; then
+            IS_FALLBACK=$(python3 -c "
+            import json
+            try:
+                data = json.load(open('cora-results.sarif'))
+                results = data.get('runs', [{}])[0].get('results', [])
+                # Only check results — rules array is empty for BOTH
+                # legitimate "no issues" AND fallback SARIF.
+                if len(results) == 1:
+                    msg = results[0].get('message', {}).get('text', '')
+                    if 'could not complete' in msg.lower():
+                        print(1)
+                    else:
+                        print(0)
+                else:
+                    print(0)
+            except Exception:
+                print(0)
+            " 2>/dev/null || echo "0")
+          fi
+
+          if [ "$IS_FALLBACK" -eq 1 ]; then
+            echo "::warning::Attempt $ATTEMPT: cora produced fallback SARIF (LLM error). Will retry."
+            # Extract the actual error from the fallback SARIF for diagnostics
+            FALLBACK_ERR=$(python3 -c "
+            import json
+            try:
+                data = json.load(open('cora-results.sarif'))
+                results = data.get('runs', [{}])[0].get('results', [])
+                if results:
+                    print(results[0].get('message', {}).get('text', '')[:200])
+            except:
+                pass
+            " 2>/dev/null || echo "unknown")
+            echo "  Fallback detail: $FALLBACK_ERR"
+            EXIT_CODE=1  # Force retry by treating as failure
+          fi
+
+          # Success: cora exited 0 AND produced valid SARIF output (not a fallback)
+          if [ "$EXIT_CODE" -eq 0 ] && [ "$SARIF_BYTES" -gt 10 ]; then
             break
           fi
 
@@ -211,7 +257,8 @@ runs:
 
         # All retries exhausted and still no valid output — generate a fallback SARIF
         # so the workflow doesn't hard-fail on transient API issues.
-        if [ "$EXIT_CODE" -ne 0 ] && [ "$SARIF_BYTES" -lt 10 ]; then
+        # If cora didn't exit cleanly, any SARIF we have is a fallback (not a real review)
+        if [ "$EXIT_CODE" -ne 0 ]; then
           echo "::warning::Cora review could not complete after $ATTEMPT attempt(s). Generating fallback SARIF."
           cat > cora-results.sarif << 'SARIF_EOF'
         {
@@ -221,7 +268,7 @@ runs:
             "tool": {
               "driver": {
                 "name": "cora",
-                "informationUri": "https://github.com/codecoradev/cora-cli",
+                "informationUri": "https://github.com/codecoradev/cora-code",
                 "version": "0.4.0"
               }
             },
@@ -260,14 +307,14 @@ runs:
     - name: Upload SARIF to GitHub Code Scanning
       if: inputs.upload-sarif == 'true' && steps.sarif-check.outputs.results > 0
       continue-on-error: true
-      uses: github/codeql-action/upload-sarif@f52b05f4acaaa234e44466e66d29050e135ea9ef # v4.36.0
+      uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
       with:
         sarif_file: cora-results.sarif
         category: cora-review
 
     - name: Post PR comment
       if: always() && github.event_name == 'pull_request'
-      uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       with:
@@ -290,14 +337,27 @@ runs:
               fileSize = 0;
             }
             if (fileSize < 10) {
-              body = `## 🔍 Cora AI Code Review\n\n⚠️ **Review could not complete.** Cora produced an empty result. Check the workflow logs for errors.\n\n---\n_Review powered by [cora-cli](https://github.com/codecoradev/cora-cli) · BYOK · MIT_`;
+              body = `## 🔍 Cora AI Code Review\n\n⚠️ **Review could not complete.** Cora produced an empty result. Check the workflow logs for errors.\n\n---\n_Review powered by [cora-code](https://github.com/codecoradev/cora-code) · BYOK · MIT_`;
             } else {
-              body = `## 🔍 Cora AI Code Review\n\n✅ **No issues found.** Code looks good!\n\n---\n_Review powered by [cora-cli](https://github.com/codecoradev/cora-cli) · BYOK · MIT_`;
+              body = `## 🔍 Cora AI Code Review\n\n✅ **No issues found.** Code looks good!\n\n---\n_Review powered by [cora-code](https://github.com/codecoradev/cora-code) · BYOK · MIT_`;
             }
           } else {
             const results = sarifContent.runs[0].results || [];
+            // Detect fallback SARIF: exactly 1 result with "could not complete" message.
+            // Do NOT use rules.length === 0 — a legitimate empty review (code is clean)
+            // also has 0 rules and 0 results. That's not a failure.
+            const isFallback = results.length === 1
+              && results[0].level === 'warning'
+              && (results[0].message?.text || '').includes('could not complete');
             if (results.length === 0) {
-              body = `## 🔍 Cora AI Code Review\n\n✅ **No issues found.** Code looks good!\n\n---\n_Review powered by [cora-cli](https://github.com/codecoradev/cora-cli) · BYOK · MIT_`;
+              body = `## 🔍 Cora AI Code Review\n\n✅ **No issues found.** Code looks good!\n\n---\n_Review powered by [cora-code](https://github.com/codecoradev/cora-code) · BYOK · MIT_`;
+            } else if (isFallback) {
+              // Extract the actual error from cora's fallback SARIF message.
+              // Format: "Cora AI review could not complete: {error}. Review was skipped..."
+              const fallbackMsg = results[0].message?.text || '';
+              const errMatch = fallbackMsg.match(/could not complete:\s*(.+?)\.\s*Review was skipped/i);
+              const errorDetail = errMatch ? errMatch[1] : 'Unknown error — check workflow logs';
+              body = `## 🔍 Cora AI Code Review\n\n⚠️ **Review could not complete.** LLM API error after retries: ${errorDetail}\n\n---\n_Review powered by [cora-code](https://github.com/codecoradev/cora-code) · BYOK · MIT_`;
             } else {
               const grouped = {};
               for (const r of results) {
@@ -328,39 +388,45 @@ runs:
                             hasWarnings ? '⚠️ **Review recommended** — warnings found.' :
                             '✅ **Passed** — only informational notes.';
 
-              body = `## 🔍 Cora AI Code Review\n\n${status}\n${table}\n---\n_Review powered by [cora-cli](https://github.com/codecoradev/cora-cli) · BYOK · MIT_`;
+              body = `## 🔍 Cora AI Code Review\n\n${status}\n${table}\n---\n_Review powered by [cora-code](https://github.com/codecoradev/cora-code) · BYOK · MIT_`;
             }
           }
 
-          const { data: comments } = await github.rest.issues.listComments({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            issue_number: context.issue.number,
-          });
-
-          const existing = comments.find(c =>
-            c.user.login === 'github-actions[bot]' &&
-            c.body.startsWith('## 🔍 Cora AI Code Review')
-          );
-
-          if (existing) {
-            await github.rest.issues.updateComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: existing.id,
-              body,
-            });
-          } else {
-            await github.rest.issues.createComment({
+          try {
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body,
             });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.startsWith('## 🔍 Cora AI Code Review')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+          } catch (e) {
+            // Fork PRs have read-only GITHUB_TOKEN — comment posting is not possible.
+            // This is expected and non-blocking; the review itself still ran successfully.
+            core.warning(`Skipping PR comment: ${e.message}`);
           }
 
     - name: Check for blocking issues
-      if: always()
+      if: always() && inputs.upload-sarif == 'true'
       shell: bash
       run: |
         if [ -f cora-results.sarif ]; then
